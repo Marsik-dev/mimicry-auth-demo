@@ -4,15 +4,13 @@ from __future__ import annotations
 import os
 import tempfile
 
-import cv2
-import numpy as np
 import streamlit as st
 
 from ...config import AppConfig
-from ...core.authentication import AuthenticationSession
 from ...storage.profile_store import ProfileStore
 from ..components.pipeline_viz import STAGE_NAMES, render_stage_output
 from ..components.stability_chart import render_stability_chart
+from ..components.webcam_capture import webcam_recorder
 
 
 def render(store: ProfileStore, config: AppConfig) -> None:
@@ -23,40 +21,32 @@ def render(store: ProfileStore, config: AppConfig) -> None:
         st.warning("Нет зарегистрированных профилей. Перейдите в **Регистрация**.")
         return
 
-    user_id = st.selectbox("Выберите профиль", profiles)
+    user_id = st.selectbox("Профиль для проверки", profiles)
     container = store.load_profile(user_id)
 
-    capture_mode = st.radio("Источник", ["Веб-камера", "Файл"], horizontal=True)
+    tab_cam, tab_file = st.tabs(["📷 Веб-камера", "📁 Загрузить файл"])
 
     result = None
 
-    if capture_mode == "Файл":
-        uploaded = st.file_uploader("Загрузить видео", type=["mp4", "avi", "mov"])
+    with tab_cam:
+        frames = webcam_recorder(key="auth_webcam", label="камера для аутентификации")
+        if frames is not None:
+            from ...core.authentication import AuthenticationSession
+            session = AuthenticationSession(container, config)
+            with st.spinner(f"Обработка {len(frames)} кадров..."):
+                result = session.authenticate_frames(frames)
+
+    with tab_file:
+        uploaded = st.file_uploader("Видео файл", type=["mp4", "avi", "mov"])
         if uploaded and st.button("Аутентифицировать"):
+            from ...core.authentication import AuthenticationSession
             with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
                 f.write(uploaded.read())
                 tmp_path = f.name
+            session = AuthenticationSession(container, config)
             with st.spinner("Обработка..."):
-                session = AuthenticationSession(container, config)
                 result = session.authenticate(tmp_path)
             os.unlink(tmp_path)
-    else:
-        frames_key = "auth_cam_frames"
-        img = st.camera_input("Снять кадр")
-        if img is not None:
-            file_bytes = np.frombuffer(img.getvalue(), np.uint8)
-            frame_bgr = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-            if frame_bgr is not None:
-                buf = st.session_state.get(frames_key, [])
-                buf.append(frame_bgr)
-                st.session_state[frames_key] = buf
-                st.info(f"Кадров: {len(buf)}")
-
-        if st.session_state.get(frames_key) and st.button("Аутентифицировать"):
-            frames = st.session_state.pop(frames_key)
-            with st.spinner("Обработка..."):
-                session = AuthenticationSession(container, config)
-                result = session.authenticate_frames(frames)
 
     if result is not None:
         _show_result(result, container)
@@ -74,15 +64,12 @@ def _show_result(result, container) -> None:
     col2.metric("Порог", result.auth_result.details.get("hamming_threshold", "—"))
     col3.metric("Уверенность", f"{result.auth_result.confidence:.1%}")
 
-    # Timings
     if result.pipeline_timings_ms:
-        st.markdown("**Время выполнения стадий (мс):**")
-        timing_cols = st.columns(len(result.pipeline_timings_ms))
-        for col, (stage, ms) in zip(timing_cols, result.pipeline_timings_ms.items()):
-            col.metric(stage, f"{ms:.0f}")
+        with st.expander("⏱ Время выполнения стадий (мс)"):
+            cols = st.columns(len(result.pipeline_timings_ms))
+            for col, (stage, ms) in zip(cols, result.pipeline_timings_ms.items()):
+                col.metric(stage, f"{ms:.0f}")
 
-    # Pipeline inspector
-    st.markdown("---")
-    st.subheader("Pipeline Inspector")
-    selected_stage = st.selectbox("Стадия", STAGE_NAMES, key="auth_stage_sel")
-    render_stage_output(selected_stage, result.stage_output)
+    with st.expander("Pipeline Inspector"):
+        selected_stage = st.selectbox("Стадия", STAGE_NAMES, key="auth_stage_sel")
+        render_stage_output(selected_stage, result.stage_output)
