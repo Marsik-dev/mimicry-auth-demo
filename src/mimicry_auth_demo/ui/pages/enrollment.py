@@ -7,7 +7,7 @@ import tempfile
 import numpy as np
 import streamlit as st
 
-from ...config import AppConfig
+from ...config import AppConfig, DEFAULT_EMOTION_POOL
 from ...core.enrollment import EnrollmentSession
 from ...storage.profile_store import ProfileStore
 from ..components.pipeline_viz import STAGE_NAMES, render_stage_output
@@ -31,11 +31,22 @@ def _load_other_vectors() -> np.ndarray | None:
 def render(store: ProfileStore, config: AppConfig) -> None:
     st.title("Регистрация пользователя")
 
-    user_id = st.text_input("Имя пользователя", value="user1", key="enroll_user_id")
+    col_uid, col_emo = st.columns([2, 1])
+    with col_uid:
+        user_id = st.text_input("Имя пользователя", value="user1", key="enroll_user_id")
+    with col_emo:
+        emotion = st.selectbox(
+            "Эмоция для регистрации",
+            config.emotion_pool,
+            key="enroll_emotion",
+            help="Используй одну и ту же эмоцию для всех образцов. "
+                 "Разные пользователи могут использовать разные эмоции из пула.",
+        )
 
-    if "enroll_session" not in st.session_state or st.session_state.get("enroll_uid") != user_id:
+    session_key = f"enroll_session_{user_id}_{emotion}"
+    if st.session_state.get("_enroll_key") != session_key:
         st.session_state["enroll_session"] = EnrollmentSession(config, user_id)
-        st.session_state["enroll_uid"] = user_id
+        st.session_state["_enroll_key"] = session_key
         st.session_state["enroll_last_stage_out"] = None
 
     session: EnrollmentSession = st.session_state["enroll_session"]

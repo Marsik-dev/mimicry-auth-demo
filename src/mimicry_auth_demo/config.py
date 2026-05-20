@@ -7,6 +7,23 @@ from typing import Any
 from mimicry_preproc.pipeline import PipelineConfig
 from npbk.trainer import TrainerConfig
 
+# Emotions a user can choose for enrollment (GOST own-class focus)
+SUPPORTED_EMOTIONS_RAVDESS: dict[str, int] = {
+    "Happy":    3,
+    "Angry":    5,
+    "Surprise": 8,
+    "Sad":      4,
+    "Fear":     6,
+    "Disgust":  7,
+}
+
+SUPPORTED_EMOTIONS_OULU: list[str] = [
+    "Happiness", "Anger", "Surprise", "Sadness", "Fear", "Disgust",
+]
+
+# Default pool shown in enrollment UI (1-2 main emotions + 1-2 alternates)
+DEFAULT_EMOTION_POOL = ["Happy", "Angry", "Surprise"]
+
 
 @dataclass
 class AppConfig:
@@ -14,6 +31,7 @@ class AppConfig:
     pipeline: PipelineConfig = field(default_factory=PipelineConfig.default)
     trainer: TrainerConfig = field(default_factory=TrainerConfig)
     n_required_own_samples: int = 11
+    emotion_pool: list[str] = field(default_factory=lambda: list(DEFAULT_EMOTION_POOL))
 
     @classmethod
     def load(cls, path: str | Path | None = None) -> "AppConfig":
