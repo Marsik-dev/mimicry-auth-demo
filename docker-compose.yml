@@ -1,0 +1,14 @@
+services:
+  demo:
+    image: ghcr.io/marsik-dev/mimicry-auth-demo:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8501:8501"
+    volumes:
+      - /home/marsel/git/datasets:/data/datasets:ro
+      - mimicry_profiles:/root/.mimicry_auth
+
+volumes:
+  mimicry_profiles:

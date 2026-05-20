@@ -5,7 +5,7 @@ import streamlit as st
 
 from .config import AppConfig
 from .storage.profile_store import ProfileStore
-from .ui.pages import analysis, authentication, enrollment, home, pipeline_inspector
+from .ui.pages import analysis, authentication, dataset_browser, enrollment, home, pipeline_inspector
 
 
 def main() -> None:
@@ -25,7 +25,8 @@ def main() -> None:
         st.markdown("---")
         page = st.radio(
             "Навигация",
-            ["Главная", "Регистрация", "Аутентификация", "Pipeline Inspector", "Анализ"],
+            ["Главная", "Регистрация", "Аутентификация",
+             "Pipeline Inspector", "Dataset Browser", "Анализ"],
             key="nav_page",
         )
 
@@ -37,6 +38,8 @@ def main() -> None:
         authentication.render(store, config)
     elif page == "Pipeline Inspector":
         pipeline_inspector.render(config)
+    elif page == "Dataset Browser":
+        dataset_browser.render(store, config)
     elif page == "Анализ":
         analysis.render(store)
 
