@@ -11,6 +11,7 @@ from ...config import AppConfig
 from ...core.enrollment import EnrollmentSession
 from ...storage.profile_store import ProfileStore
 from ..components.pipeline_viz import STAGE_NAMES, render_stage_output
+from ..components.realtime_processor import realtime_pipeline_widget
 from ..components.stability_chart import render_stability_chart
 from ..components.webcam_capture import webcam_recorder
 
@@ -57,7 +58,14 @@ def render(store: ProfileStore, config: AppConfig) -> None:
         "Нужно собрать минимум **11 образцов**."
     )
 
-    tab_cam, tab_file = st.tabs(["📷 Веб-камера", "📁 Загрузить файл"])
+    tab_live, tab_cam, tab_file = st.tabs(["🔴 Live preview", "📷 Запись", "📁 Файл"])
+
+    with tab_live:
+        st.markdown(
+            "Живой предпросмотр — помогает убедиться что лицо детектируется "
+            "до начала записи образца."
+        )
+        realtime_pipeline_widget(key="enroll_live", initial_mode="landmark_extractor")
 
     with tab_cam:
         frames = webcam_recorder(key="enroll_webcam", label="камера для регистрации")

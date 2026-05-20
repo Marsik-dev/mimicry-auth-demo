@@ -1,6 +1,11 @@
 """
 Pipeline Inspector — live webcam feed, per-stage visualization,
 real-time parameter editing with persistent session state.
+
+Tabs:
+  🔴 Live        — real-time processing overlay on webcam stream
+  📷 Webcam      — record, then run full pipeline and inspect result
+  📁 File        — upload video, run pipeline, inspect result
 """
 from __future__ import annotations
 
@@ -18,40 +23,52 @@ from ..components.pipeline_settings import (
     render_stage_settings,
 )
 from ..components.pipeline_viz import STAGE_NAMES, render_stage_output
+from ..components.realtime_processor import realtime_pipeline_widget
 from ..components.webcam_capture import webcam_recorder
 
 
 def render(config: AppConfig) -> None:
     st.title("Pipeline Inspector")
-    st.markdown(
-        "Настраивай параметры каждой стадии и смотри её вывод в реальном времени."
-    )
 
     with st.sidebar:
-        st.markdown("### Стадии пайплайна")
+        st.markdown("### Параметры стадии")
+        # Stage selector only relevant for non-live tabs
         selected_stage = st.radio(
-            "Активная стадия", STAGE_NAMES, index=4, key="inspector_stage"
+            "Стадия (для вкладок Webcam/File)",
+            STAGE_NAMES, index=4, key="inspector_stage",
         )
         st.markdown("---")
-        st.markdown("### Параметры стадии")
         changed = render_stage_settings(selected_stage)
         st.markdown("---")
-        current_cfg = get_current_config()
-        export_config_button(current_cfg)
+        export_config_button(get_current_config())
 
-    tab_cam, tab_file = st.tabs(["📷 Веб-камера", "📁 Файл"])
+    tab_live, tab_cam, tab_file = st.tabs(["🔴 Live", "📷 Webcam", "📁 File"])
 
-    stage_out = None
+    # ------------------------------------------------------------------
+    # Tab: Live real-time processing
+    # ------------------------------------------------------------------
+    with tab_live:
+        st.markdown(
+            "Камера обрабатывается **кадр за кадром** в реальном времени. "
+            "Выбери стадию — её вывод рисуется поверх видео."
+        )
+        realtime_pipeline_widget(key="inspector_live", initial_mode="landmark_extractor")
 
+    # ------------------------------------------------------------------
+    # Tab: record then process
+    # ------------------------------------------------------------------
     with tab_cam:
-        st.markdown("Запиши видео, затем нажми **Запустить** чтобы увидеть вывод выбранной стадии.")
+        st.markdown("Запиши видео, затем запусти полный пайплайн и изучи вывод любой стадии.")
         frames = webcam_recorder(key="inspector_webcam", label="камера инспектора")
         if frames is not None:
-            pipeline = Pipeline(current_cfg)
+            pipeline = Pipeline(get_current_config())
             with st.spinner(f"Обработка {len(frames)} кадров..."):
                 stage_out = pipeline.run_with_debug_from_frames(frames)
             st.session_state["inspector_last_out"] = stage_out
 
+    # ------------------------------------------------------------------
+    # Tab: file
+    # ------------------------------------------------------------------
     with tab_file:
         uploaded = st.file_uploader("Видео", type=["mp4", "avi", "mov"])
         if uploaded:
@@ -59,7 +76,7 @@ def render(config: AppConfig) -> None:
                 with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
                     f.write(uploaded.read())
                     tmp_path = f.name
-                pipeline = Pipeline(current_cfg)
+                pipeline = Pipeline(get_current_config())
                 with st.spinner("Обработка..."):
                     stage_out = pipeline.run_with_debug(tmp_path)
                 os.unlink(tmp_path)
@@ -68,9 +85,9 @@ def render(config: AppConfig) -> None:
     if changed:
         st.rerun()
 
-    last_out = stage_out or st.session_state.get("inspector_last_out")
+    # Show last result (for webcam/file tabs)
+    last_out = st.session_state.get("inspector_last_out")
     if last_out is not None:
         st.markdown("---")
+        st.subheader(f"Вывод стадии: {selected_stage}")
         render_stage_output(selected_stage, last_out)
-    else:
-        st.info("Запусти пайплайн чтобы увидеть вывод стадии.")

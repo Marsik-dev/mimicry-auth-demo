@@ -9,6 +9,7 @@ import streamlit as st
 from ...config import AppConfig
 from ...storage.profile_store import ProfileStore
 from ..components.pipeline_viz import STAGE_NAMES, render_stage_output
+from ..components.realtime_processor import realtime_pipeline_widget
 from ..components.stability_chart import render_stability_chart
 from ..components.webcam_capture import webcam_recorder
 
@@ -24,9 +25,13 @@ def render(store: ProfileStore, config: AppConfig) -> None:
     user_id = st.selectbox("Профиль для проверки", profiles)
     container = store.load_profile(user_id)
 
-    tab_cam, tab_file = st.tabs(["📷 Веб-камера", "📁 Загрузить файл"])
+    tab_live, tab_cam, tab_file = st.tabs(["🔴 Live preview", "📷 Запись", "📁 Файл"])
 
     result = None
+
+    with tab_live:
+        st.markdown("Убедись что лицо детектируется, прежде чем записывать.")
+        realtime_pipeline_widget(key="auth_live", initial_mode="face_detector")
 
     with tab_cam:
         frames = webcam_recorder(key="auth_webcam", label="камера для аутентификации")
