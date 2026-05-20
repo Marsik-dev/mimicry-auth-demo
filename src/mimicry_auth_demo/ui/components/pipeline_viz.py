@@ -54,7 +54,7 @@ def _render_frames(frames: list) -> None:
         img = frame.image
         if img.ndim == 2:
             img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
-        col.image(img, caption=f"t={frame.timestamp_ms:.0f}ms", use_column_width=True)
+        col.image(img, caption=f"t={frame.timestamp_ms:.0f}ms", use_container_width=True)
 
 
 def _render_faces(faces: list) -> None:
@@ -67,7 +67,7 @@ def _render_faces(faces: list) -> None:
         img = face.aligned if face.aligned is not None else face.frame.image
         if img.ndim == 2:
             img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
-        col.image(img, caption=f"conf={face.confidence:.2f}", use_column_width=True)
+        col.image(img, caption=f"conf={face.confidence:.2f}", use_container_width=True)
 
 
 def _render_landmarks(landmarks: list, faces: list) -> None:
@@ -88,7 +88,7 @@ def _render_landmarks(landmarks: list, faces: list) -> None:
         x, y = int(px * w), int(py * h)
         cv2.circle(overlay, (x, y), 2, (0, 255, 0), -1)
 
-    st.image(overlay, caption=f"Frame {lm.face_region.frame.index} — 68 landmarks", use_column_width=True)
+    st.image(overlay, caption=f"Frame {lm.face_region.frame.index} — 68 landmarks", use_container_width=True)
     st.caption(f"Mean visibility: {lm.visibility.mean():.2f}")
 
 

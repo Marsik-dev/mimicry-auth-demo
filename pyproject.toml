@@ -28,7 +28,7 @@ dev = [
 ]
 
 [project.scripts]
-mimicry-demo = "mimicry_auth_demo.app:main"
+mimicry-demo = "mimicry_auth_demo._run:run"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/mimicry_auth_demo"]
