@@ -73,35 +73,88 @@ _GRAY   = (120, 120, 120)
 class _PipelineVideoProcessor(VideoProcessorBase):
     """
     Stateful per-session video processor.
-    The Streamlit main thread writes to `mode` and `config`;
-    recv() reads them under a lock.
+    The Streamlit main thread writes to `mode`;
+    recv() reads it under a lock.
+
+    Jitter reduction:
+    - MediaPipe FaceDetector and FaceLandmarker run in VIDEO mode so they
+      use internal temporal smoothing between frames.
+    - EMA (alpha=0.35) is applied to bbox coordinates and landmark points
+      for additional stability on top of MediaPipe's own filtering.
     """
+
+    # EMA smoothing factor: lower = smoother but more lag, higher = less lag but more jitter
+    _EMA_ALPHA: float = 0.35
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._mode: StageMode = "landmark_extractor"
-        self._face_detector = None
-        self._landmark_extractor = None
+        self._face_detector_mp = None    # raw MediaPipe VIDEO-mode detector
+        self._landmarker_mp = None       # raw MediaPipe VIDEO-mode landmarker
         self._quality_filter = None
         self._prev_gray: np.ndarray | None = None
         self._fps_t: float = time.time()
         self._fps: float = 0.0
+        self._timestamp_ms: int = 0
+
+        # EMA state for smoothing
+        self._smooth_bbox: np.ndarray | None = None   # (4,) float [x,y,w,h]
+        self._smooth_pts68: np.ndarray | None = None  # (68, 2) float
+        self._smooth_pts478: np.ndarray | None = None  # (478, 2) float
+
         self._init_pipeline()
 
     # ------------------------------------------------------------------
-    # Lazy init (runs in recv thread)
+    # Init — create VIDEO-mode MediaPipe objects directly for low latency
     # ------------------------------------------------------------------
     def _init_pipeline(self) -> None:
         try:
-            from mimicry_preproc.stages.face_detector import FaceDetector, FaceDetectorConfig
-            from mimicry_preproc.stages.landmark_extractor import LandmarkExtractor, LandmarkExtractorConfig
-            from mimicry_preproc.stages.quality_filter import QualityFilter, QualityFilterConfig
+            import mediapipe as mp
+            from pathlib import Path
 
-            self._face_detector = FaceDetector(FaceDetectorConfig(min_confidence=0.4))
-            self._landmark_extractor = LandmarkExtractor(LandmarkExtractorConfig(min_confidence=0.4))
+            model_dir = Path(__file__).parent.parent.parent.parent.parent.parent / "mimicry-preproc" / "models"
+
+            BaseOptions = mp.tasks.BaseOptions
+            RunningMode = mp.tasks.vision.RunningMode
+
+            # Face detector in VIDEO mode
+            det_opts = mp.tasks.vision.FaceDetectorOptions(
+                base_options=BaseOptions(model_asset_path=str(model_dir / "face_detector.tflite")),
+                running_mode=RunningMode.VIDEO,
+                min_detection_confidence=0.4,
+            )
+            self._face_detector_mp = mp.tasks.vision.FaceDetector.create_from_options(det_opts)
+
+            # Face landmarker in VIDEO mode — enables MediaPipe temporal filtering
+            lm_opts = mp.tasks.vision.FaceLandmarkerOptions(
+                base_options=BaseOptions(model_asset_path=str(model_dir / "face_landmarker.task")),
+                running_mode=RunningMode.VIDEO,
+                num_faces=1,
+                min_face_detection_confidence=0.4,
+                min_face_presence_confidence=0.4,
+                min_tracking_confidence=0.4,
+                output_face_blendshapes=False,
+                output_facial_transformation_matrixes=False,
+            )
+            self._landmarker_mp = mp.tasks.vision.FaceLandmarker.create_from_options(lm_opts)
+
+            from mimicry_preproc.stages.quality_filter import QualityFilter, QualityFilterConfig
             self._quality_filter = QualityFilter(QualityFilterConfig(min_sharpness=30.0))
+
         except Exception as e:
             print(f"[RealtimeProcessor] init error: {e}")
+
+    def _to_mp_image(self, img_bgr: np.ndarray):
+        import mediapipe as mp
+        return mp.Image(
+            image_format=mp.ImageFormat.SRGB,
+            data=cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB),
+        )
+
+    def _ema(self, new: np.ndarray, old: np.ndarray | None) -> np.ndarray:
+        if old is None:
+            return new.astype(np.float32)
+        return (self._EMA_ALPHA * new + (1 - self._EMA_ALPHA) * old).astype(np.float32)
 
     # ------------------------------------------------------------------
     # Public API — called from Streamlit main thread
@@ -124,10 +177,13 @@ class _PipelineVideoProcessor(VideoProcessorBase):
         with self._lock:
             mode = self._mode
 
+        # Increment timestamp for MediaPipe VIDEO mode
+        self._timestamp_ms += 33  # ~30 FPS
+
         try:
             out = self._process(img_bgr, mode)
         except Exception:
-            out = img_bgr
+            out = img_bgr.copy()
 
         # FPS counter
         now = time.time()
@@ -139,194 +195,198 @@ class _PipelineVideoProcessor(VideoProcessorBase):
         return av.VideoFrame.from_ndarray(out, format="bgr24")
 
     # ------------------------------------------------------------------
-    # Processing per mode
+    # Processing per mode — uses VIDEO-mode MediaPipe + EMA smoothing
     # ------------------------------------------------------------------
     def _process(self, img: np.ndarray, mode: StageMode) -> np.ndarray:
         if mode == "raw":
             return img
 
-        from mimicry_preproc.types import Frame
-        frame = Frame(image=img, timestamp_ms=0.0, index=0)
+        mp_img = self._to_mp_image(img)
+        ih, iw = img.shape[:2]
 
-        # Face detection (needed for all modes except raw)
-        face_region = None
-        if self._face_detector is not None:
-            face_region = self._face_detector.detect(frame)
+        # --- Face detection (VIDEO mode → temporal smoothing) ---
+        raw_bbox: np.ndarray | None = None
+        if self._face_detector_mp is not None:
+            det_result = self._face_detector_mp.detect_for_video(mp_img, self._timestamp_ms)
+            if det_result.detections:
+                d = det_result.detections[0]
+                bb = d.bounding_box
+                raw_bbox = np.array([bb.origin_x, bb.origin_y, bb.width, bb.height], np.float32)
+
+        # EMA on bbox
+        if raw_bbox is not None:
+            self._smooth_bbox = self._ema(raw_bbox, self._smooth_bbox)
+        bbox_smooth = self._smooth_bbox
 
         if mode == "face_detector":
-            return self._draw_face(img, face_region)
+            return self._draw_face_smooth(img, bbox_smooth,
+                                          det_result.detections[0].categories[0].score
+                                          if (raw_bbox is not None and
+                                              self._face_detector_mp and
+                                              det_result.detections) else 0.0)
 
         if mode == "quality_filter":
-            return self._draw_quality(img, face_region)
+            return self._draw_quality_smooth(img, bbox_smooth)
 
-        if face_region is None:
-            _draw_text(img, "No face detected", (10, 50), _RED)
+        if bbox_smooth is None:
+            _draw_text(img.copy(), "No face detected", (10, 50), _RED)
             return img
 
         if mode == "stabilizer":
-            return self._draw_stabilizer(img, face_region)
+            return self._draw_stabilizer_raw(img, bbox_smooth)
 
-        # Landmark extraction (needed for landmark and feature modes)
-        landmarks = None
-        if self._landmark_extractor is not None:
-            landmarks = self._landmark_extractor.extract(face_region)
+        # --- Landmarks (VIDEO mode → temporal smoothing) ---
+        raw_pts68: np.ndarray | None = None
+        raw_pts478: np.ndarray | None = None
+        if self._landmarker_mp is not None:
+            lm_result = self._landmarker_mp.detect_for_video(mp_img, self._timestamp_ms)
+            if lm_result.face_landmarks:
+                mp_lm = lm_result.face_landmarks[0]
+                # All 478 points
+                raw_pts478 = np.array([[lm.x, lm.y] for lm in mp_lm], np.float32)
+                # 68-point subset via W300_TO_MP mapping
+                from mimicry_preproc.stages.landmark_extractor import W300_TO_MP
+                pts68 = np.zeros((68, 2), np.float32)
+                for w300_idx in range(68):
+                    mp_idx = W300_TO_MP.get(w300_idx)
+                    if mp_idx is not None and mp_idx < len(mp_lm):
+                        pts68[w300_idx] = [mp_lm[mp_idx].x, mp_lm[mp_idx].y]
+                raw_pts68 = pts68
+
+        # EMA on landmark points
+        if raw_pts68 is not None:
+            self._smooth_pts68 = self._ema(raw_pts68, self._smooth_pts68)
+        if raw_pts478 is not None:
+            self._smooth_pts478 = self._ema(raw_pts478, self._smooth_pts478)
 
         if mode == "landmark_extractor":
-            return self._draw_landmarks(img, face_region, landmarks)
+            return self._draw_landmarks_smooth(img, bbox_smooth, self._smooth_pts68)
 
         if mode == "all_landmarks":
-            return self._draw_all_landmarks(img, face_region)
+            return self._draw_all_landmarks_smooth(img, bbox_smooth, self._smooth_pts478)
 
         if mode == "feature_extractor":
-            return self._draw_features(img, face_region, landmarks)
+            return self._draw_features_smooth(img, bbox_smooth, self._smooth_pts68)
 
         return img
 
     # ------------------------------------------------------------------
-    # Drawing helpers
+    # Drawing helpers (all use smoothed coordinates)
     # ------------------------------------------------------------------
-    def _draw_face(self, img: np.ndarray, face_region) -> np.ndarray:
+    def _draw_face_smooth(self, img: np.ndarray, bbox: np.ndarray | None, conf: float) -> np.ndarray:
         out = img.copy()
-        if face_region is None:
+        if bbox is None:
             _draw_text(out, "No face", (10, 50), _RED)
             return out
-        x, y, w, h = face_region.bbox
+        x, y, w, h = bbox.astype(int)
         cv2.rectangle(out, (x, y), (x + w, y + h), _GREEN, 2)
-        _draw_text(out, f"conf={face_region.confidence:.2f}", (x, y - 8), _GREEN)
+        _draw_text(out, f"conf={conf:.2f}", (x, max(y - 8, 12)), _GREEN)
         return out
 
-    def _draw_quality(self, img: np.ndarray, face_region) -> np.ndarray:
+    def _draw_quality_smooth(self, img: np.ndarray, bbox: np.ndarray | None) -> np.ndarray:
         out = img.copy()
-        if face_region is None:
+        if bbox is None:
             _draw_text(out, "No face", (10, 50), _RED)
             return out
-
-        score = self._quality_filter.assess(face_region) if self._quality_filter else None
-        x, y, w, h = face_region.bbox
-        color = _GREEN if (score and score.passed) else _RED
-        cv2.rectangle(out, (x, y), (x + w, y + h), color, 2)
-
-        if score:
-            lines = [
-                f"sharp={score.sharpness:.0f}",
-                f"bright={score.brightness:.2f}",
-                f"{'PASS' if score.passed else 'FAIL'}",
-            ]
-            for i, line in enumerate(lines):
-                _draw_text(out, line, (x, y - 8 - i * 18), color)
-        return out
-
-    def _draw_stabilizer(self, img: np.ndarray, face_region) -> np.ndarray:
-        out = img.copy()
-        x, y, w, h = face_region.bbox
-        cv2.rectangle(out, (x, y), (x + w, y + h), _GREEN, 2)
-
-        # Show optical flow arrows if we have a previous frame
+        x, y, w, h = bbox.astype(int)
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        if self._prev_gray is not None and self._prev_gray.shape == gray.shape:
-            # Compute sparse optical flow on grid points inside face bbox
-            pts = np.array([
-                [x + w * fx, y + h * fy]
-                for fx in [0.25, 0.5, 0.75]
-                for fy in [0.25, 0.5, 0.75]
-            ], dtype=np.float32).reshape(-1, 1, 2)
-            next_pts, status, _ = cv2.calcOpticalFlowPyrLK(
-                self._prev_gray, gray, pts, None,
-                winSize=(15, 15), maxLevel=2,
-                criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03),
-            )
-            for (px, py), (nx, ny), ok in zip(
-                pts.reshape(-1, 2), next_pts.reshape(-1, 2), status.reshape(-1)
-            ):
-                if ok:
-                    cv2.arrowedLine(out, (int(px), int(py)), (int(nx), int(ny)),
-                                    _YELLOW, 2, tipLength=0.4)
+        x2, y2 = min(img.shape[1], x + w), min(img.shape[0], y + h)
+        crop = gray[max(0, y):y2, max(0, x):x2]
+        sharpness = float(cv2.Laplacian(crop, cv2.CV_64F).var()) if crop.size > 0 else 0.0
+        brightness = float(crop.mean()) / 255.0 if crop.size > 0 else 0.0
+        passed = sharpness >= 30.0 and 0.1 <= brightness <= 0.95
+        color = _GREEN if passed else _RED
+        cv2.rectangle(out, (x, y), (x + w, y + h), color, 2)
+        for i, txt in enumerate([f"sharp={sharpness:.0f}", f"bright={brightness:.2f}",
+                                   "PASS" if passed else "FAIL"]):
+            _draw_text(out, txt, (x, max(y - 8 - i * 18, 12)), color)
+        return out
+
+    def _draw_stabilizer_raw(self, img: np.ndarray, bbox: np.ndarray | None) -> np.ndarray:
+        out = img.copy()
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        if bbox is not None:
+            x, y, w, h = bbox.astype(int)
+            cv2.rectangle(out, (x, y), (x + w, y + h), _GREEN, 1)
+            if self._prev_gray is not None and self._prev_gray.shape == gray.shape:
+                pts = np.array([[x + w * fx, y + h * fy]
+                                 for fx in [0.25, 0.5, 0.75]
+                                 for fy in [0.25, 0.5, 0.75]], np.float32).reshape(-1, 1, 2)
+                next_pts, status, _ = cv2.calcOpticalFlowPyrLK(
+                    self._prev_gray, gray, pts, None,
+                    winSize=(15, 15), maxLevel=2,
+                    criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03),
+                )
+                for (px, py), (nx, ny), ok in zip(
+                    pts.reshape(-1, 2), next_pts.reshape(-1, 2), status.reshape(-1)
+                ):
+                    if ok:
+                        cv2.arrowedLine(out, (int(px), int(py)), (int(nx), int(ny)),
+                                        _YELLOW, 2, tipLength=0.4)
         self._prev_gray = gray
         _draw_text(out, "Stabilizer / Optical Flow", (10, 50), _YELLOW)
         return out
 
-    def _draw_landmarks(self, img: np.ndarray, face_region, landmarks) -> np.ndarray:
+    def _draw_landmarks_smooth(self, img: np.ndarray, bbox: np.ndarray | None,
+                                pts68: np.ndarray | None) -> np.ndarray:
         out = img.copy()
-        x, y, w, h = face_region.bbox
-        cv2.rectangle(out, (x, y), (x + w, y + h), _GRAY, 1)
+        if bbox is not None:
+            x, y, w, h = bbox.astype(int)
+            cv2.rectangle(out, (x, y), (x + w, y + h), _GRAY, 1)
 
-        if landmarks is None:
-            _draw_text(out, "Landmarks: none", (10, 50), _RED)
-            return out
-
-        ih, iw = img.shape[:2]
-        pts_px = np.column_stack([
-            (landmarks.points[:, 0] * iw).astype(int),
-            (landmarks.points[:, 1] * ih).astype(int),
-        ])
-
-        # Connections
-        for i, j in _LANDMARK_CONNECTIONS:
-            if i < len(pts_px) and j < len(pts_px):
-                cv2.line(out, tuple(pts_px[i]), tuple(pts_px[j]), _GRAY, 1, cv2.LINE_AA)
-
-        # Points (color by visibility)
-        for k, (px, py) in enumerate(pts_px):
-            vis = float(landmarks.visibility[k])
-            color = (0, int(80 + 140 * vis), int(200 * vis))
-            cv2.circle(out, (px, py), 2, color, -1, cv2.LINE_AA)
-
-        vis_mean = float(landmarks.visibility.mean())
-        _draw_text(out, f"68 pts  vis={vis_mean:.2f}", (10, 50), _GREEN)
-        return out
-
-    def _draw_all_landmarks(self, img: np.ndarray, face_region) -> np.ndarray:
-        """Draw all 478 MediaPipe FaceLandmarker points."""
-        out = img.copy()
-        x, y, w, h = face_region.bbox
-        cv2.rectangle(out, (x, y), (x + w, y + h), _GRAY, 1)
-
-        if self._landmark_extractor is None or self._landmark_extractor._landmarker is None:
-            _draw_text(out, "Landmarker not ready", (10, 50), _RED)
-            return out
-
-        import cv2 as _cv2
-        import mediapipe as mp
-
-        img_rgb = _cv2.cvtColor(face_region.aligned if face_region.aligned is not None
-                                 else img, _cv2.COLOR_BGR2RGB)
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=img_rgb)
-        result = self._landmark_extractor._landmarker.detect(mp_image)
-
-        if not result.face_landmarks:
+        if pts68 is None:
             _draw_text(out, "No landmarks", (10, 50), _RED)
             return out
 
         ih, iw = img.shape[:2]
-        mp_lm = result.face_landmarks[0]
+        pts_px = (pts68 * np.array([iw, ih])).astype(int)
 
-        # Draw all 478 points as small dots
-        for lm in mp_lm:
-            px, py = int(lm.x * iw), int(lm.y * ih)
-            # Color by Z depth (closer = brighter green)
-            brightness = max(0, min(255, int(180 + lm.z * -500)))
-            cv2.circle(out, (px, py), 1, (0, brightness, 60), -1, cv2.LINE_AA)
+        for i, j in _LANDMARK_CONNECTIONS:
+            if i < len(pts_px) and j < len(pts_px):
+                cv2.line(out, tuple(pts_px[i]), tuple(pts_px[j]), _GRAY, 1, cv2.LINE_AA)
 
-        _draw_text(out, f"478 pts (MediaPipe FaceMesh)", (10, 50), _GREEN)
+        for px, py in pts_px:
+            cv2.circle(out, (int(px), int(py)), 2, _GREEN, -1, cv2.LINE_AA)
+
+        _draw_text(out, "68 pts (300W) — EMA smoothed", (10, 50), _GREEN)
         return out
 
-    def _draw_features(self, img: np.ndarray, face_region, landmarks) -> np.ndarray:
-        # Draw landmarks first
-        out = self._draw_landmarks(img, face_region, landmarks)
+    def _draw_all_landmarks_smooth(self, img: np.ndarray, bbox: np.ndarray | None,
+                                    pts478: np.ndarray | None) -> np.ndarray:
+        out = img.copy()
+        if bbox is not None:
+            x, y, w, h = bbox.astype(int)
+            cv2.rectangle(out, (x, y), (x + w, y + h), _GRAY, 1)
 
-        if landmarks is not None:
+        if pts478 is None:
+            _draw_text(out, "No landmarks", (10, 50), _RED)
+            return out
+
+        ih, iw = img.shape[:2]
+        for i, (nx, ny) in enumerate(pts478):
+            px, py = int(nx * iw), int(ny * ih)
+            cv2.circle(out, (px, py), 1, (0, 200, 80), -1, cv2.LINE_AA)
+
+        _draw_text(out, f"478 pts (MediaPipe) — EMA smoothed", (10, 50), _GREEN)
+        return out
+
+    def _draw_all_landmarks(self, img: np.ndarray, face_region) -> np.ndarray:
+        """Legacy — redirects to smooth version."""
+        return self._draw_all_landmarks_smooth(img, None, self._smooth_pts478)
+
+    def _draw_features_smooth(self, img: np.ndarray, bbox: np.ndarray | None,
+                               pts68: np.ndarray | None) -> np.ndarray:
+        out = self._draw_landmarks_smooth(img, bbox, pts68)
+
+        if pts68 is not None:
             from mimicry_preproc.features.geometric import extract_from_frame
-            geo = extract_from_frame(landmarks.points)
-
-            # Mini bar chart in bottom-left corner
+            geo = extract_from_frame(pts68)
             n = min(30, len(geo))
-            bar_h, bar_w = 60, 3
-            pad = 4
-            x0, y0 = pad, out.shape[0] - 60 - pad
-            _mini_bar_chart(out, geo[:n], x0, y0, bar_w, 60, _GREEN, _RED)
-            _draw_text(out, f"geo[:{n}]", (x0, y0 - 5), _GRAY, scale=0.4)
+            _mini_bar_chart(out, geo[:n], 4, out.shape[0] - 64, 3, 60, _GREEN, _RED)
+            _draw_text(out, f"geo[:{n}]", (4, out.shape[0] - 68), _GRAY, scale=0.4)
 
         return out
+
 
 
 # ---------------------------------------------------------------------------
