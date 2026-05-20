@@ -9,9 +9,10 @@ Supported overlay modes:
   "raw"              — no processing, passthrough
   "face_detector"    — bounding box + confidence
   "quality_filter"   — bbox + sharpness/brightness scores
-  "landmark_extractor" — 68-point face mesh
+  "landmark_extractor" — 68-point face mesh (300W standard subset)
+  "all_landmarks"    — all 478 MediaPipe FaceMesh points
   "feature_extractor"  — landmark overlay + feature vector stats bar
-  "stabilizer"       — landmark overlay on stabilized frame
+  "stabilizer"       — optical flow arrows
 """
 from __future__ import annotations
 
@@ -32,7 +33,12 @@ _RTC_CONFIG = RTCConfiguration(
 
 StageMode = Literal[
     "raw", "face_detector", "quality_filter",
-    "stabilizer", "landmark_extractor", "feature_extractor",
+    "stabilizer", "landmark_extractor", "all_landmarks", "feature_extractor",
+]
+
+_ALL_STAGES: list[StageMode] = [
+    "raw", "face_detector", "quality_filter",
+    "stabilizer", "landmark_extractor", "all_landmarks", "feature_extractor",
 ]
 
 _LANDMARK_CONNECTIONS = [
@@ -168,6 +174,9 @@ class _PipelineVideoProcessor(VideoProcessorBase):
         if mode == "landmark_extractor":
             return self._draw_landmarks(img, face_region, landmarks)
 
+        if mode == "all_landmarks":
+            return self._draw_all_landmarks(img, face_region)
+
         if mode == "feature_extractor":
             return self._draw_features(img, face_region, landmarks)
 
@@ -266,6 +275,41 @@ class _PipelineVideoProcessor(VideoProcessorBase):
         _draw_text(out, f"68 pts  vis={vis_mean:.2f}", (10, 50), _GREEN)
         return out
 
+    def _draw_all_landmarks(self, img: np.ndarray, face_region) -> np.ndarray:
+        """Draw all 478 MediaPipe FaceLandmarker points."""
+        out = img.copy()
+        x, y, w, h = face_region.bbox
+        cv2.rectangle(out, (x, y), (x + w, y + h), _GRAY, 1)
+
+        if self._landmark_extractor is None or self._landmark_extractor._landmarker is None:
+            _draw_text(out, "Landmarker not ready", (10, 50), _RED)
+            return out
+
+        import cv2 as _cv2
+        import mediapipe as mp
+
+        img_rgb = _cv2.cvtColor(face_region.aligned if face_region.aligned is not None
+                                 else img, _cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=img_rgb)
+        result = self._landmark_extractor._landmarker.detect(mp_image)
+
+        if not result.face_landmarks:
+            _draw_text(out, "No landmarks", (10, 50), _RED)
+            return out
+
+        ih, iw = img.shape[:2]
+        mp_lm = result.face_landmarks[0]
+
+        # Draw all 478 points as small dots
+        for lm in mp_lm:
+            px, py = int(lm.x * iw), int(lm.y * ih)
+            # Color by Z depth (closer = brighter green)
+            brightness = max(0, min(255, int(180 + lm.z * -500)))
+            cv2.circle(out, (px, py), 1, (0, brightness, 60), -1, cv2.LINE_AA)
+
+        _draw_text(out, f"478 pts (MediaPipe FaceMesh)", (10, 50), _GREEN)
+        return out
+
     def _draw_features(self, img: np.ndarray, face_region, landmarks) -> np.ndarray:
         # Draw landmarks first
         out = self._draw_landmarks(img, face_region, landmarks)
@@ -306,11 +350,18 @@ def realtime_pipeline_widget(
     # Mode selector
     mode = st.selectbox(
         "Стадия пайплайна (live overlay)",
-        ["raw", "face_detector", "quality_filter",
-         "stabilizer", "landmark_extractor", "feature_extractor"],
-        index=["raw", "face_detector", "quality_filter",
-               "stabilizer", "landmark_extractor", "feature_extractor"].index(mode),
+        _ALL_STAGES,
+        index=_ALL_STAGES.index(mode) if mode in _ALL_STAGES else 4,
         key=f"_rt_mode_{key}",
+        format_func=lambda s: {
+            "raw": "raw — без обработки",
+            "face_detector": "face_detector — bbox лица",
+            "quality_filter": "quality_filter — резкость/яркость",
+            "stabilizer": "stabilizer — optical flow",
+            "landmark_extractor": "landmark_extractor — 68 точек 300W",
+            "all_landmarks": "all_landmarks — все 478 точек MediaPipe",
+            "feature_extractor": "feature_extractor — 68 точек + гистограмма",
+        }.get(s, s),
     )
 
     ctx = webrtc_streamer(

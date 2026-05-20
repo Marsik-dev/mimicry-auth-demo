@@ -65,7 +65,8 @@ class RAVDESSAdapter:
         result = []
         for mp4 in sorted(subj_dir.glob("*.mp4")):
             parts = mp4.stem.split("-")
-            if len(parts) == 7 and parts[0] == "02" and parts[2] == emo_num:
+            # RAVDESS uses zero-padded numbers ("03"), dict keys are unpadded ("3")
+            if len(parts) == 7 and parts[0] == "02" and int(parts[2]) == int(emo_num):
                 result.append(Recording(
                     path=mp4,
                     subject_id=subject,
