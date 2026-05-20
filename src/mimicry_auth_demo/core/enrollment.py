@@ -69,7 +69,8 @@ class EnrollmentSession:
             self._quality_scores.append(result.quality_score)
 
     def is_ready_to_train(self) -> bool:
-        return len(self._own_vectors) >= self.config.n_required_own_samples
+        # Can train with as few as 1 sample (augmentation covers the rest)
+        return len(self._own_vectors) >= 1
 
     def get_progress(self) -> EnrollmentProgress:
         return EnrollmentProgress(
@@ -81,10 +82,18 @@ class EnrollmentSession:
 
     def train(self, other_vectors: np.ndarray) -> tuple[TrainingResult, NBKContainer]:
         if not self.is_ready_to_train():
-            raise RuntimeError(
-                f"Not enough samples: {len(self._own_vectors)} / {self.config.n_required_own_samples}"
-            )
-        own = np.stack(self._own_vectors)
+            raise RuntimeError("Нет образцов для обучения")
+
+        own_raw = np.stack(self._own_vectors)
+        target = self.config.n_required_own_samples
+
+        # Augment if below GOST minimum
+        if len(own_raw) < target:
+            from npbk import augment_own
+            own = augment_own(own_raw, target_count=target)
+        else:
+            own = own_raw
+
         ts = TrainingSet(own_vectors=own, other_vectors=other_vectors)
         result = NPBKTrainer(self.config.trainer).train(ts)
         container = NBKContainer.from_result(
