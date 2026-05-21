@@ -8,7 +8,7 @@ jobs:
   docker:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
       packages: write
 
     steps:
@@ -34,3 +34,16 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          body: |
+            ## Docker
+
+            ```bash
+            docker pull ghcr.io/marsik-dev/mimicry-auth-demo:${{ github.ref_name }}
+            ```
+
+            или с docker-compose — см. README.

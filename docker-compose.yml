@@ -1,14 +1,54 @@
 services:
+  db:
+    image: postgres:16-alpine
+    env_file: .env
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-mimicry}
+      POSTGRES_USER: ${POSTGRES_USER:-mimicry}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-mimicry}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    env_file: .env
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL:-admin@mimicry.local}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD:-changeme}
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+      PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: "False"
+    ports:
+      - "5050:80"
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+      - ./pgadmin_servers.json:/pgadmin4/servers.json:ro
+
   demo:
     image: ghcr.io/marsik-dev/mimicry-auth-demo:latest
     build:
       context: .
       dockerfile: Dockerfile
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-mimicry}:${POSTGRES_PASSWORD:-changeme}@db:5432/${POSTGRES_DB:-mimicry}
     ports:
       - "8501:8501"
     volumes:
       - /home/marsel/git/datasets:/data/datasets:ro
-      - mimicry_profiles:/root/.mimicry_auth
+    depends_on:
+      db:
+        condition: service_healthy
 
 volumes:
-  mimicry_profiles:
+  pg_data:
+  pgadmin_data:

@@ -1,0 +1,14 @@
+{
+  "Servers": {
+    "1": {
+      "Name": "Mimicry Auth DB",
+      "Group": "Servers",
+      "Host": "db",
+      "Port": 5432,
+      "MaintenanceDB": "mimicry",
+      "Username": "mimicry",
+      "SSLMode": "prefer",
+      "Comment": "НПБК биометрическая аутентификация"
+    }
+  }
+}
